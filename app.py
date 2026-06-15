@@ -3,11 +3,11 @@ DMT To KMZ Generator  (Streamlit app)
 
 Upload a DeLorme Street Atlas .dmt and download a Google Earth .kmz with
 AGMs (purple triangles / red flags / blue dots), Access (blue lines),
-Centerline (red lines) and Notes (map-note text + red X) layers.
+Centerline (red lines) and Notes (map-note symbols + red X "Do Not Enter").
 The Gibson Integrity logo is embedded in every output file.
 
-Single-file app: the DMT parser + KML/KMZ writer are included below, followed
-by the Streamlit UI. No third-party dependencies beyond streamlit.
+Icons and colours follow the Google Earth seed-file legend.
+Single-file app; only dependency is streamlit.
 """
 
 import base64
@@ -131,11 +131,12 @@ def _valid(lon, lat):
 # --------------------------------------------------------------------------
 # Layer parsers
 # --------------------------------------------------------------------------
+# DeLorme symbol code -> meaning (matches the seed-file legend)
 SYMBOL_CODE = {
-    0x01: "triangle",   # purple triangle
-    0x02: "flag",       # red flag
-    0x04: "dot",        # blue dot
-    0x03: "redx",       # red X (notes)
+    0x01: "triangle",   # purple triangle  -> AGM
+    0x02: "flag",       # red flag         -> AGM
+    0x04: "dot",        # blue dot         -> AGM
+    0x03: "redx",       # red X            -> Note "Do Not Enter"
 }
 
 _POINT_MARKER = re.compile(rb"\x00\x01\x41")     # <code> 00 01 41
@@ -253,50 +254,60 @@ def classify_stream(name, buf):
 
 
 # --------------------------------------------------------------------------
-# KML / KMZ writer
+# KML / KMZ writer  (icons + colours follow the Google Earth seed legend)
 # --------------------------------------------------------------------------
 def _esc(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             .replace('"', "&quot;"))
 
 
+# AGM icon styles  (KML colour = AABBGGRR)
+#   purple triangle, red flag, blue dot  (per seed "AGM Type" sheet)
 _AGM_STYLES = {
     "triangle": ("http://maps.google.com/mapfiles/kml/shapes/triangle.png", "ff800080"),
     "flag":     ("http://maps.google.com/mapfiles/kml/shapes/flag.png",     "ff0000ff"),
     "dot":      ("http://maps.google.com/mapfiles/kml/paddle/blu-circle.png", "ffff0000"),
 }
-_NOTE_ICON = "http://maps.google.com/mapfiles/kml/shapes/forbidden.png"
+# Notes legend (seed "NOTES" sheet):
+#   Map Note    -> icon 40  (pal3/icon54 map-note symbol)
+#   Do Not Enter (red X) -> forbidden.png
+_MAPNOTE_ICON = "http://maps.google.com/mapfiles/kml/pal3/icon54.png"
+_REDX_ICON = "http://maps.google.com/mapfiles/kml/shapes/forbidden.png"
+# Line colours (seed "ACCESS"/"CENTERLINE" sheets):
+#   Access = Blue (ffff0000)   Centerline = Red (ff0000ff)
+_ACCESS_COLOR = "ffff0000"
+_CENTERLINE_COLOR = "ff0000ff"
 
 
 def _point_placemark(name, lon, lat, style_id):
     nm = _esc(name) if name else ""
     return (
         "\t\t\t<Placemark>\n"
-        f"\t\t\t\t<name>{nm}</name>\n"
-        f"\t\t\t\t<description>{nm}</description>\n"
-        f"\t\t\t\t<styleUrl>#{style_id}</styleUrl>\n"
+        "\t\t\t\t<name>" + nm + "</name>\n"
+        "\t\t\t\t<description>" + nm + "</description>\n"
+        "\t\t\t\t<styleUrl>#" + style_id + "</styleUrl>\n"
         "\t\t\t\t<Point>\n"
-        f"\t\t\t\t\t<coordinates>{lon:.7f},{lat:.7f},0</coordinates>\n"
+        "\t\t\t\t\t<coordinates>%.7f,%.7f,0</coordinates>\n" % (lon, lat) +
         "\t\t\t\t</Point>\n"
         "\t\t\t</Placemark>\n"
     )
 
 
 def _line_placemark(idx, verts, style_id):
-    coords = " ".join(f"{lo:.7f},{la:.7f},0" for lo, la in verts)
+    coords = " ".join("%.7f,%.7f,0" % (lo, la) for lo, la in verts)
     return (
         "\t\t\t<Placemark>\n"
-        f"\t\t\t\t<name>Line {idx}</name>\n"
-        f"\t\t\t\t<styleUrl>#{style_id}</styleUrl>\n"
+        "\t\t\t\t<name>Line " + str(idx) + "</name>\n"
+        "\t\t\t\t<styleUrl>#" + style_id + "</styleUrl>\n"
         "\t\t\t\t<LineString>\n"
         "\t\t\t\t\t<tessellate>1</tessellate>\n"
-        f"\t\t\t\t\t<coordinates>{coords}</coordinates>\n"
+        "\t\t\t\t\t<coordinates>" + coords + "</coordinates>\n"
         "\t\t\t\t</LineString>\n"
         "\t\t\t</Placemark>\n"
     )
 
 
-def build_kml(doc_name, agms, access, centerline, notes, include_logo=True):
+def build_kml(doc_name, agms, access, centerline, notes, redx, include_logo=True):
     P = []
     P.append('<?xml version="1.0" encoding="UTF-8"?>\n')
     P.append('<kml xmlns="http://www.opengis.net/kml/2.2" '
@@ -304,34 +315,52 @@ def build_kml(doc_name, agms, access, centerline, notes, include_logo=True):
              'xmlns:kml="http://www.opengis.net/kml/2.2" '
              'xmlns:atom="http://www.w3.org/2005/Atom">\n')
     P.append("<Document>\n")
-    P.append(f"\t<name>{_esc(doc_name)}</name>\n")
+    P.append("\t<name>" + _esc(doc_name) + "</name>\n")
 
+    # AGM icon styles
     for sid, (href, color) in _AGM_STYLES.items():
         P.append(
-            f'\t<Style id="agm_{sid}">\n'
+            '\t<Style id="agm_' + sid + '">\n'
             "\t\t<IconStyle>\n"
-            f"\t\t\t<color>{color}</color>\n"
+            "\t\t\t<color>" + color + "</color>\n"
             "\t\t\t<scale>1.1</scale>\n"
-            f'\t\t\t<Icon><href>{href}</href></Icon>\n'
+            "\t\t\t<Icon><href>" + href + "</href></Icon>\n"
             "\t\t</IconStyle>\n"
             "\t\t<BalloonStyle><text>$[name]</text></BalloonStyle>\n"
             "\t</Style>\n"
         )
+
+    # Map-note symbol (name hidden until mouse-over, per seed HideNameUntilMouseOver)
+    for tag, scale in (("note_n", "0"), ("note_h", "1")):
+        P.append(
+            '\t<Style id="' + tag + '">\n'
+            "\t\t<IconStyle><scale>1.1</scale>"
+            "<Icon><href>" + _MAPNOTE_ICON + "</href></Icon></IconStyle>\n"
+            "\t\t<LabelStyle><scale>" + scale + "</scale></LabelStyle>\n"
+            "\t\t<BalloonStyle><text>$[name]</text></BalloonStyle>\n"
+            "\t</Style>\n"
+        )
     P.append(
-        '\t<Style id="note_style">\n'
-        "\t\t<IconStyle>\n"
-        "\t\t\t<scale>1</scale>\n"
-        f'\t\t\t<Icon><href>{_NOTE_ICON}</href></Icon>\n'
-        "\t\t</IconStyle>\n"
+        '\t<StyleMap id="note_style">\n'
+        "\t\t<Pair><key>normal</key><styleUrl>#note_n</styleUrl></Pair>\n"
+        "\t\t<Pair><key>highlight</key><styleUrl>#note_h</styleUrl></Pair>\n"
+        "\t</StyleMap>\n"
+    )
+    # Red X / Do Not Enter
+    P.append(
+        '\t<Style id="redx_style">\n'
+        "\t\t<IconStyle><scale>1.1</scale>"
+        "<Icon><href>" + _REDX_ICON + "</href></Icon></IconStyle>\n"
         "\t\t<BalloonStyle><text>$[name]</text></BalloonStyle>\n"
         "\t</Style>\n"
     )
+    # Line styles
     P.append('\t<Style id="access_line">\n'
-             "\t\t<LineStyle><color>ffff0000</color><width>3</width></LineStyle>\n"
-             "\t</Style>\n")
+             "\t\t<LineStyle><color>" + _ACCESS_COLOR + "</color>"
+             "<width>3</width></LineStyle>\n\t</Style>\n")
     P.append('\t<Style id="centerline_line">\n'
-             "\t\t<LineStyle><color>ff0000ff</color><width>3</width></LineStyle>\n"
-             "\t</Style>\n")
+             "\t\t<LineStyle><color>" + _CENTERLINE_COLOR + "</color>"
+             "<width>3</width></LineStyle>\n\t</Style>\n")
 
     if include_logo:
         P.append(
@@ -346,27 +375,33 @@ def build_kml(doc_name, agms, access, centerline, notes, include_logo=True):
             "\t</ScreenOverlay>\n"
         )
 
+    # AGMs
     P.append("\t<Folder>\n\t\t<name>AGMs</name>\n")
     for p in agms:
         kind = SYMBOL_CODE.get(p["code"], "dot")
         if kind not in _AGM_STYLES:
             kind = "dot"
-        P.append(_point_placemark(p["name"], p["lon"], p["lat"], f"agm_{kind}"))
+        P.append(_point_placemark(p["name"], p["lon"], p["lat"], "agm_" + kind))
     P.append("\t</Folder>\n")
 
+    # Access (blue)
     P.append("\t<Folder>\n\t\t<name>Access</name>\n")
     for i, verts in enumerate(access, 1):
         P.append(_line_placemark(i, verts, "access_line"))
     P.append("\t</Folder>\n")
 
+    # Centerline (red)
     P.append("\t<Folder>\n\t\t<name>Centerline</name>\n")
     for i, verts in enumerate(centerline, 1):
         P.append(_line_placemark(i, verts, "centerline_line"))
     P.append("\t</Folder>\n")
 
+    # Notes: map-note text + red X
     P.append("\t<Folder>\n\t\t<name>Notes</name>\n")
     for p in notes:
         P.append(_point_placemark(p["name"], p["lon"], p["lat"], "note_style"))
+    for p in redx:
+        P.append(_point_placemark(p["name"], p["lon"], p["lat"], "redx_style"))
     P.append("\t</Folder>\n")
 
     P.append("</Document>\n</kml>\n")
@@ -375,7 +410,7 @@ def build_kml(doc_name, agms, access, centerline, notes, include_logo=True):
 
 def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None):
     ole = OLEFile(dmt_bytes)
-    agms, access, centerline, notes = [], [], [], []
+    agms, access, centerline, notes, redx = [], [], [], [], []
 
     for name, size in ole.stream_names():
         if size < 16:
@@ -392,10 +427,14 @@ def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None):
             centerline += parse_lines(buf)
         elif layer == "notes":
             notes += parse_text_notes(buf)
-            notes += [{"name": p["name"], "lon": p["lon"], "lat": p["lat"]}
-                      for p in parse_points(buf)]
+            for p in parse_points(buf):
+                # red X (code 3) -> Do Not Enter; any other symbol -> map note
+                if SYMBOL_CODE.get(p["code"]) == "redx":
+                    redx.append(p)
+                else:
+                    notes.append({"name": p["name"], "lon": p["lon"], "lat": p["lat"]})
 
-    kml = build_kml(doc_name, agms, access, centerline, notes,
+    kml = build_kml(doc_name, agms, access, centerline, notes, redx,
                     include_logo=logo_png is not None)
 
     out = io.BytesIO()
@@ -409,7 +448,8 @@ def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None):
         "Access vertices": sum(len(l) for l in access),
         "Centerline lines": len(centerline),
         "Centerline vertices": sum(len(l) for l in centerline),
-        "Notes": len(notes),
+        "Map notes": len(notes),
+        "Red X": len(redx),
     }
     return out.getvalue(), stats
 
@@ -547,14 +587,13 @@ GIBSON_LOGO_PNG = base64.b64decode(_GIBSON_LOGO_B64)
 # --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
-st.set_page_config(page_title="DMT To KMZ Generator", page_icon="🗺️")
+st.set_page_config(page_title="DMT To KMZ Generator", page_icon="🗺")
 st.title("DMT To KMZ Generator")
 st.caption(
-    "Convert a DeLorme Street Atlas .dmt into a Google Earth .kmz with "
-    "AGMs, Access, Centerline and Notes layers. Recognizes purple triangles, "
-    "red flags and blue dots as AGMs; blue drive lines as Access; red "
-    "centerlines as Centerline; map notes and red X's as Notes. The Gibson "
-    "Integrity logo is embedded in every output."
+    "Convert a DeLorme Street Atlas .dmt into a Google Earth .kmz. "
+    "Purple triangles, red flags and blue dots become AGMs; blue lines "
+    "become Access; red lines become Centerline; map notes and red X's "
+    "become Notes. The Gibson Integrity logo is embedded in every output."
 )
 
 uploaded = st.file_uploader("Upload DMT file", type=["dmt"])
@@ -569,21 +608,25 @@ else:
             dmt_bytes, doc_name=base, logo_png=GIBSON_LOGO_PNG
         )
     except Exception as e:
-        st.error(f"Could not convert this file: {e}")
+        st.error("Could not convert this file: %s" % e)
     else:
         st.success("Conversion complete.")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("AGMs", stats["AGMs"])
         c2.metric("Access lines", stats["Access lines"])
         c3.metric("Centerline lines", stats["Centerline lines"])
-        c4.metric("Notes", stats["Notes"])
+        c4.metric("Notes", stats["Map notes"] + stats["Red X"])
         st.caption(
-            f"Access vertices: {stats['Access vertices']:,} • "
-            f"Centerline vertices: {stats['Centerline vertices']:,}"
+            "Map notes: %d \u2022 Red X: %d \u2022 Access vertices: %s \u2022 "
+            "Centerline vertices: %s" % (
+                stats["Map notes"], stats["Red X"],
+                format(stats["Access vertices"], ","),
+                format(stats["Centerline vertices"], ","),
+            )
         )
         st.download_button(
             "Download KMZ",
             data=kmz_bytes,
-            file_name=f"{base}.kmz",
+            file_name="%s.kmz" % base,
             mime="application/vnd.google-earth.kmz",
         )
