@@ -270,34 +270,99 @@ _AGM_STYLES = {
 }
 
 _SP_NAME = re.compile(r"^\s*SP\s*\d+", re.I)
+_SYMBOL_TO_KIND = {
+    "blue dot": "dot", "purple triangle": "triangle", "red flag": "flag",
+    "blue": "dot", "purple": "triangle", "red": "flag",
+}
 
 
-def assign_agm_kinds(pts):
-    """Assign each AGM point an icon kind: 'triangle', 'dot' or 'flag'.
+def read_seed_symbols(xlsx_bytes):
+    """Read AGM (lat, lon, kind) from a Google Earth seed .xlsx.
 
-    The DeLorme symbol code is an ARBITRARY per-file index (Red Flag is id 2
-    in some jobs, 3 in others; Blue Dot is 4 in some, 3 in others), so it
-    cannot be mapped globally.  What is stable across every job produced from
-    the Google Earth seed file:
-      * Purple Triangle (valves) is always symbol code 1.
-      * Blue Dots are the survey points (names like SP01, SP02 ...); within a
-        file they all share one code -- the "dot code".
-      * Everything else is an AGM rebar -> Red Flag.
-    So we infer this file's dot code from the survey-point names, then map:
-      code 1 -> triangle, dot code -> dot, anything else -> flag.
+    The seed determines each AGM's shape from its AGM Type via XLOOKUP; the
+    resolved Symbol / IconColor plus coordinates live in the workbook.  We
+    return a list of (lat, lon, kind) so the DMT points can be matched by
+    coordinate.  Requires openpyxl.
+    """
+    import io as _io
+    import openpyxl
+    wb = openpyxl.load_workbook(_io.BytesIO(xlsx_bytes), data_only=True)
+    out = []
+    # Preferred: "Delorme Import Template" (Lat, Lon, Name, Symbol)
+    candidates = [
+        ("Delorme Import Template", 0, 1, 3),   # symbol name in col D
+        ("AGMs", 0, 1, 4),                       # IconColor in col E
+    ]
+    for sheet, ci_lat, ci_lon, ci_sym in candidates:
+        if sheet not in wb.sheetnames:
+            continue
+        ws = wb[sheet]
+        rows = []
+        for r in ws.iter_rows(min_row=2, values_only=True):
+            if len(r) <= max(ci_lat, ci_lon, ci_sym):
+                continue
+            lat, lon, sym = r[ci_lat], r[ci_lon], r[ci_sym]
+            if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+                continue
+            kind = _SYMBOL_TO_KIND.get(str(sym).strip().lower()) if sym else None
+            if kind:
+                rows.append((float(lat), float(lon), kind))
+        if rows:
+            return rows
+    return []
+
+
+def _fallback_kinds(pts):
+    """Best-effort AGM shapes from the DMT alone (no seed).
+
+    The DeLorme symbol code is an arbitrary per-file index, so this is only a
+    heuristic: the most common code is taken as Red Flag (rebar), survey
+    points (SP##) as Blue Dots, the rest as Purple Triangle.  Accurate shapes
+    require the seed file.
     """
     from collections import Counter
+    codes = Counter(p["code"] for p in pts)
+    flag_code = codes.most_common(1)[0][0] if codes else None
     sp_codes = Counter(p["code"] for p in pts if _SP_NAME.match(p["name"] or ""))
     dot_code = sp_codes.most_common(1)[0][0] if sp_codes else None
     for p in pts:
         c = p["code"]
-        if c == 1:
-            p["kind"] = "triangle"
-        elif dot_code is not None and c == dot_code:
+        if dot_code is not None and c == dot_code:
             p["kind"] = "dot"
-        else:
+        elif c == flag_code:
             p["kind"] = "flag"
+        else:
+            p["kind"] = "triangle"
     return pts
+
+
+def assign_agm_kinds(pts, seed_symbols=None):
+    """Assign each AGM point a shape ('triangle','dot','flag').
+
+    If seed_symbols (list of (lat, lon, kind) from the seed file) is given,
+    each point takes the shape of the nearest seed AGM -- the authoritative
+    source, since the seed's Type->symbol lookup is how the job was built.
+    Without a seed, falls back to a DMT-only heuristic.
+    """
+    if seed_symbols:
+        for p in pts:
+            best = None
+            bd = 9.0e9
+            for la, lo, kind in seed_symbols:
+                d = (p["lon"] - lo) ** 2 + (p["lat"] - la) ** 2
+                if d < bd:
+                    bd = d
+                    best = kind
+            # ~1e-3 deg ~ 100 m tolerance; beyond that, fall back per-point
+            p["kind"] = best if (best and bd < 1e-8) else None
+        if all(p["kind"] for p in pts):
+            return pts
+        # some points unmatched -> heuristic for those, keep matched ones
+        matched = [p for p in pts if p["kind"]]
+        unmatched = [p for p in pts if not p["kind"]]
+        _fallback_kinds(unmatched)
+        return matched + unmatched
+    return _fallback_kinds(pts)
 
 # Notes legend (seed "NOTES" sheet):
 #   Map Note    -> icon 40  (pal3/icon54 map-note symbol)
@@ -437,7 +502,7 @@ def build_kml(doc_name, agms, access, centerline, notes, redx, include_logo=True
     return "".join(P)
 
 
-def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None):
+def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None, seed_symbols=None):
     ole = OLEFile(dmt_bytes)
     agms, access, centerline, notes, redx = [], [], [], [], []
 
@@ -449,7 +514,7 @@ def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None):
             continue
         layer = classify_stream(name, buf)
         if layer == "agm":
-            agms += assign_agm_kinds(parse_points(buf))
+            agms += assign_agm_kinds(parse_points(buf), seed_symbols)
         elif layer == "access":
             access += parse_lines(buf)
         elif layer == "centerline":
@@ -622,20 +687,42 @@ st.caption(
 )
 
 uploaded = st.file_uploader("Upload DMT file", type=["dmt"])
+seed_file = st.file_uploader(
+    "Upload Google Earth Seed File (.xlsx) - sets the correct AGM shapes",
+    type=["xlsx"],
+)
 
 if uploaded is None:
-    st.info("Upload a .dmt to begin.")
+    st.info("Upload a .dmt to begin. Add the matching seed file so AGMs get "
+            "the correct purple triangle / red flag / blue dot shapes.")
 else:
     base = os.path.splitext(uploaded.name)[0]
+    seed_symbols = None
+    seed_note = ""
+    if seed_file is not None:
+        try:
+            seed_symbols = read_seed_symbols(seed_file.read())
+            seed_note = ("AGM shapes read from seed file (%d AGMs)."
+                         % len(seed_symbols)) if seed_symbols else ""
+            if not seed_symbols:
+                st.warning("Could not read AGM shapes from that seed file; "
+                           "using a best-effort guess instead.")
+        except Exception as e:
+            st.warning("Could not read the seed file (%s); using a best-effort "
+                       "guess for AGM shapes." % e)
+    else:
+        st.warning("No seed file provided - AGM shapes are a best-effort guess. "
+                   "Upload the seed file for correct shapes.")
     try:
         dmt_bytes = uploaded.read()
         kmz_bytes, stats = convert_dmt_bytes(
-            dmt_bytes, doc_name=base, logo_png=GIBSON_LOGO_PNG
+            dmt_bytes, doc_name=base, logo_png=GIBSON_LOGO_PNG,
+            seed_symbols=seed_symbols,
         )
     except Exception as e:
         st.error("Could not convert this file: %s" % e)
     else:
-        st.success("Conversion complete.")
+        st.success("Conversion complete." + ("  " + seed_note if seed_note else ""))
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("AGMs", stats["AGMs"])
         c2.metric("Access lines", stats["Access lines"])
