@@ -264,15 +264,15 @@ def _esc(s):
 # AGM icon styles  (KML colour = AABBGGRR)
 #   purple triangle, red flag, blue dot  (per seed "AGM Type" sheet)
 _AGM_STYLES = {
-    "triangle": ("http://maps.google.com/mapfiles/kml/shapes/triangle.png", "ff800080"),
-    "flag":     ("http://maps.google.com/mapfiles/kml/shapes/flag.png",     "ff0000ff"),
-    "dot":      ("http://maps.google.com/mapfiles/kml/paddle/blu-circle.png", "ffff0000"),
+    "triangle": ("https://maps.google.com/mapfiles/kml/shapes/triangle.png", "ff800080"),
+    "flag":     ("https://maps.google.com/mapfiles/kml/shapes/flag.png",     "ff0000ff"),
+    "dot":      ("https://maps.google.com/mapfiles/kml/paddle/blu-circle.png", "ffff0000"),
 }
 # Notes legend (seed "NOTES" sheet):
 #   Map Note    -> icon 40  (pal3/icon54 map-note symbol)
 #   Do Not Enter (red X) -> forbidden.png
-_MAPNOTE_ICON = "http://maps.google.com/mapfiles/kml/pal3/icon54.png"
-_REDX_ICON = "http://maps.google.com/mapfiles/kml/shapes/forbidden.png"
+_MAPNOTE_ICON = "https://maps.google.com/mapfiles/kml/pal3/icon54.png"
+_REDX_ICON = "https://maps.google.com/mapfiles/kml/shapes/forbidden.png"
 # Line colours (seed "ACCESS"/"CENTERLINE" sheets):
 #   Access = Blue (ffff0000)   Centerline = Red (ff0000ff)
 _ACCESS_COLOR = "ffff0000"
