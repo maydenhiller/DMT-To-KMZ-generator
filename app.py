@@ -268,6 +268,21 @@ _AGM_STYLES = {
     "flag":     ("https://maps.google.com/mapfiles/kml/shapes/flag.png",     "ff0000ff"),
     "dot":      ("https://maps.google.com/mapfiles/kml/paddle/blu-circle.png", "ffff0000"),
 }
+
+def agm_kind(code):
+    """Map a DeLorme AGM symbol code to its Google Earth icon kind.
+
+    Across jobs the codes are not fixed for flags (Red Flag is id 2 in some
+    files, id 3 in others), but Purple Triangle is always 1 and Blue Dot is
+    always 4.  Survey points are the only Blue Dots; everything that is not a
+    triangle or a dot is an AGM rebar -> Red Flag.
+    """
+    if code == 1:
+        return "triangle"
+    if code == 4:
+        return "dot"
+    return "flag"
+
 # Notes legend (seed "NOTES" sheet):
 #   Map Note    -> icon 40  (pal3/icon54 map-note symbol)
 #   Do Not Enter (red X) -> forbidden.png
@@ -378,9 +393,7 @@ def build_kml(doc_name, agms, access, centerline, notes, redx, include_logo=True
     # AGMs
     P.append("\t<Folder>\n\t\t<name>AGMs</name>\n")
     for p in agms:
-        kind = SYMBOL_CODE.get(p["code"], "dot")
-        if kind not in _AGM_STYLES:
-            kind = "dot"
+        kind = agm_kind(p["code"])
         P.append(_point_placemark(p["name"], p["lon"], p["lat"], "agm_" + kind))
     P.append("\t</Folder>\n")
 
@@ -427,12 +440,8 @@ def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None):
             centerline += parse_lines(buf)
         elif layer == "notes":
             notes += parse_text_notes(buf)
-            for p in parse_points(buf):
-                # red X (code 3) -> Do Not Enter; any other symbol -> map note
-                if SYMBOL_CODE.get(p["code"]) == "redx":
-                    redx.append(p)
-                else:
-                    notes.append({"name": p["name"], "lon": p["lon"], "lat": p["lat"]})
+            # symbol points in the Notes layer are red X "Do Not Enter" markers
+            redx += parse_points(buf)
 
     kml = build_kml(doc_name, agms, access, centerline, notes, redx,
                     include_logo=logo_png is not None)
