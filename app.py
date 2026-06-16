@@ -269,19 +269,35 @@ _AGM_STYLES = {
     "dot":      ("https://maps.google.com/mapfiles/kml/paddle/blu-circle.png", "ffff0000"),
 }
 
-def agm_kind(code):
-    """Map a DeLorme AGM symbol code to its Google Earth icon kind.
+_SP_NAME = re.compile(r"^\s*SP\s*\d+", re.I)
 
-    Across jobs the codes are not fixed for flags (Red Flag is id 2 in some
-    files, id 3 in others), but Purple Triangle is always 1 and Blue Dot is
-    always 4.  Survey points are the only Blue Dots; everything that is not a
-    triangle or a dot is an AGM rebar -> Red Flag.
+
+def assign_agm_kinds(pts):
+    """Assign each AGM point an icon kind: 'triangle', 'dot' or 'flag'.
+
+    The DeLorme symbol code is an ARBITRARY per-file index (Red Flag is id 2
+    in some jobs, 3 in others; Blue Dot is 4 in some, 3 in others), so it
+    cannot be mapped globally.  What is stable across every job produced from
+    the Google Earth seed file:
+      * Purple Triangle (valves) is always symbol code 1.
+      * Blue Dots are the survey points (names like SP01, SP02 ...); within a
+        file they all share one code -- the "dot code".
+      * Everything else is an AGM rebar -> Red Flag.
+    So we infer this file's dot code from the survey-point names, then map:
+      code 1 -> triangle, dot code -> dot, anything else -> flag.
     """
-    if code == 1:
-        return "triangle"
-    if code == 4:
-        return "dot"
-    return "flag"
+    from collections import Counter
+    sp_codes = Counter(p["code"] for p in pts if _SP_NAME.match(p["name"] or ""))
+    dot_code = sp_codes.most_common(1)[0][0] if sp_codes else None
+    for p in pts:
+        c = p["code"]
+        if c == 1:
+            p["kind"] = "triangle"
+        elif dot_code is not None and c == dot_code:
+            p["kind"] = "dot"
+        else:
+            p["kind"] = "flag"
+    return pts
 
 # Notes legend (seed "NOTES" sheet):
 #   Map Note    -> icon 40  (pal3/icon54 map-note symbol)
@@ -393,7 +409,7 @@ def build_kml(doc_name, agms, access, centerline, notes, redx, include_logo=True
     # AGMs
     P.append("\t<Folder>\n\t\t<name>AGMs</name>\n")
     for p in agms:
-        kind = agm_kind(p["code"])
+        kind = p.get("kind", "flag")
         P.append(_point_placemark(p["name"], p["lon"], p["lat"], "agm_" + kind))
     P.append("\t</Folder>\n")
 
@@ -433,7 +449,7 @@ def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None):
             continue
         layer = classify_stream(name, buf)
         if layer == "agm":
-            agms += parse_points(buf)
+            agms += assign_agm_kinds(parse_points(buf))
         elif layer == "access":
             access += parse_lines(buf)
         elif layer == "centerline":
