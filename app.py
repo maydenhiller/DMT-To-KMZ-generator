@@ -312,6 +312,61 @@ def read_seed_symbols(xlsx_bytes):
     return []
 
 
+def parse_symbol_text(text):
+    """Read AGM (lat, lon, kind) from a DeLorme draw-layer export (.txt) or CSV.
+
+    Handles the native DeLorme symbol export:
+        BEGIN SYMBOL
+        47.5572,-102.9909,000,PURPLE TRIANGLE
+    and the seed-derived CSV:
+        Latitude,Longitude,Name ,Symbol
+        47.5572,-102.9909,000,Purple Triangle
+    Symbol text is matched loosely: contains TRIANGLE/FLAG/DOT(or CIRCLE).
+    """
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.upper().startswith("BEGIN ") or line.upper().startswith("END "):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        try:
+            lat = float(parts[0]); lon = float(parts[1])
+        except ValueError:
+            continue  # header row or non-data
+        # symbol is the 4th column (index 3); some exports append extra
+        # legend columns, so scan from column 3 and take the first match.
+        kind = None
+        for cell in parts[3:]:
+            u = cell.upper()
+            if "TRIANGLE" in u:
+                kind = "triangle"; break
+            if "FLAG" in u:
+                kind = "flag"; break
+            if "DOT" in u or "CIRCLE" in u:
+                kind = "dot"; break
+            k = _SYMBOL_TO_KIND.get(cell.strip().lower())
+            if k:
+                kind = k; break
+        if kind:
+            out.append((lat, lon, kind))
+    return out
+
+
+def read_symbol_source(filename, data):
+    """Read AGM symbols from an uploaded file (.txt/.csv export or .xlsx seed).
+    Returns list of (lat, lon, kind)."""
+    fn = (filename or "").lower()
+    if fn.endswith(".xlsx") or fn.endswith(".xlsm"):
+        return read_seed_symbols(data)
+    try:
+        text = data.decode("utf-8", "replace")
+    except Exception:
+        text = data.decode("latin1", "replace")
+    return parse_symbol_text(text)
+
+
 def _fallback_kinds(pts):
     """Best-effort AGM shapes from the DMT alone (no seed).
 
@@ -687,37 +742,39 @@ st.caption(
 )
 
 uploaded = st.file_uploader("Upload DMT file", type=["dmt"])
-seed_file = st.file_uploader(
-    "Upload Google Earth Seed File (.xlsx) - sets the correct AGM shapes",
-    type=["xlsx"],
+sym_files = st.file_uploader(
+    "Upload AGM symbol export(s) (.txt or .xlsx) - sets the correct AGM shapes. "
+    "Export the AGM draw layer(s) from DeLorme as text, or use the seed file.",
+    type=["txt", "csv", "xlsx", "xlsm"],
+    accept_multiple_files=True,
 )
 
 if uploaded is None:
-    st.info("Upload a .dmt to begin. Add the matching seed file so AGMs get "
+    st.info("Upload a .dmt to begin. Add the AGM symbol export(s) so AGMs get "
             "the correct purple triangle / red flag / blue dot shapes.")
 else:
     base = os.path.splitext(uploaded.name)[0]
-    seed_symbols = None
+    seed_symbols = []
     seed_note = ""
-    if seed_file is not None:
-        try:
-            seed_symbols = read_seed_symbols(seed_file.read())
-            seed_note = ("AGM shapes read from seed file (%d AGMs)."
-                         % len(seed_symbols)) if seed_symbols else ""
-            if not seed_symbols:
-                st.warning("Could not read AGM shapes from that seed file; "
-                           "using a best-effort guess instead.")
-        except Exception as e:
-            st.warning("Could not read the seed file (%s); using a best-effort "
-                       "guess for AGM shapes." % e)
+    if sym_files:
+        for f in sym_files:
+            try:
+                seed_symbols += read_symbol_source(f.name, f.read())
+            except Exception as e:
+                st.warning("Could not read %s (%s)." % (f.name, e))
+        if seed_symbols:
+            seed_note = "AGM shapes read from export (%d symbols)." % len(seed_symbols)
+        else:
+            st.warning("No AGM shapes found in the uploaded file(s); using a "
+                       "best-effort guess instead.")
     else:
-        st.warning("No seed file provided - AGM shapes are a best-effort guess. "
-                   "Upload the seed file for correct shapes.")
+        st.warning("No AGM symbol export provided - AGM shapes are a best-effort "
+                   "guess. Add the exported AGM .txt (or seed .xlsx) for correct shapes.")
     try:
         dmt_bytes = uploaded.read()
         kmz_bytes, stats = convert_dmt_bytes(
             dmt_bytes, doc_name=base, logo_png=GIBSON_LOGO_PNG,
-            seed_symbols=seed_symbols,
+            seed_symbols=seed_symbols or None,
         )
     except Exception as e:
         st.error("Could not convert this file: %s" % e)
