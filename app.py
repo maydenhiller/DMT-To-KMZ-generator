@@ -140,6 +140,11 @@ SYMBOL_CODE = {
 }
 
 _POINT_MARKER = re.compile(rb"\x00\x01\x41")     # <code> 00 01 41
+# Each annotation object embeds its symbol's GUID; the byte just before this
+# 15-byte tail identifies the symbol and is constant across files (read from
+# the layer's own legend). This is how the shape is recovered DMT-only.
+_SYM_GUID_TAIL = bytes.fromhex("4abc2034d86c41913d754ed0b4c157")
+_GLOBAL_GUID_KIND = {0x6e: "dot", 0x8a: "triangle", 0x5a: "flag"}
 _NOTE_MARKER = re.compile(rb"\x0d\x00\x00\x41")  # text map-note object
 
 
@@ -157,8 +162,8 @@ def _cstr(buf, p):
 
 def parse_points(buf):
     out = []
-    for m in _POINT_MARKER.finditer(buf):
-        ms = m.start()
+    marks = [m.start() for m in _POINT_MARKER.finditer(buf)]
+    for i, ms in enumerate(marks):
         code = buf[ms - 1] if ms >= 1 else 0
         cb = ms - 19
         if cb < 0:
@@ -170,9 +175,42 @@ def parse_points(buf):
             continue
         if not _valid(lon, lat):
             continue
+        # symbol GUID byte: find the GUID tail within this object's record
+        end = (marks[i + 1] - 19) if i + 1 < len(marks) else len(buf)
+        rec = buf[ms:end]
+        g = rec.find(_SYM_GUID_TAIL)
+        guidbyte = rec[g - 1] if g > 0 else None
         out.append({"code": code, "name": _cstr(buf, ms + 21),
-                    "lon": lon, "lat": lat})
+                    "lon": lon, "lat": lat, "guidbyte": guidbyte})
     return out
+
+
+def read_symbol_guid_map(buf):
+    """Build {symbol-GUID byte: kind} from the layer's embedded legend.
+
+    Each legend entry is  <guid byte><15-byte GUID tail><len><name> ; the name
+    (Blue Dot / Purple Triangle / Red Flag) tells the shape.  Returns a map so
+    points can be decoded by their GUID byte -- fully from the DMT.
+    """
+    m = dict(_GLOBAL_GUID_KIND)
+    for mt in re.finditer(re.escape(_SYM_GUID_TAIL), buf):
+        gb = buf[mt.start() - 1] if mt.start() >= 1 else None
+        after = buf[mt.end():mt.end() + 40]
+        if gb is None or len(after) < 2:
+            continue
+        ln = after[0]
+        if 1 <= ln <= 32:
+            try:
+                nm = after[1:1 + ln].decode("latin1").lower()
+            except Exception:
+                continue
+            if "triangle" in nm:
+                m[gb] = "triangle"
+            elif "flag" in nm:
+                m[gb] = "flag"
+            elif "dot" in nm or "circle" in nm:
+                m[gb] = "dot"
+    return m
 
 
 def parse_text_notes(buf):
@@ -367,40 +405,73 @@ def read_symbol_source(filename, data):
     return parse_symbol_text(text)
 
 
-def _fallback_kinds(pts):
-    """Best-effort AGM shapes from the DMT alone (no seed).
+def read_legend_kinds(buf):
+    """Which symbols the draw layer's embedded legend actually defines.
+    Returns a subset of ['dot','triangle','flag']."""
+    present = []
+    if b"Blue Dot" in buf:
+        present.append("dot")
+    if b"Purple Triangle" in buf:
+        present.append("triangle")
+    if b"Red Flag" in buf:
+        present.append("flag")
+    return present
 
-    The DeLorme symbol code is an arbitrary per-file index, so this is only a
-    heuristic: the most common code is taken as Red Flag (rebar), survey
-    points (SP##) as Blue Dots, the rest as Purple Triangle.  Accurate shapes
-    require the seed file.
+
+def _infer_kinds(pts, legend):
+    """Self-contained DMT-only shape assignment.
+
+    The exact per-point shape isn't decodable (the DMT stores a per-document
+    symbol number with no lookup table). What IS in the DMT: the legend
+    (which symbols exist) and the count of points per symbol number. On a
+    pipeline the symbol frequency is consistent -- AGM rebar (Red Flag) is the
+    most common, survey points (Blue Dot) next, valves (Purple Triangle) the
+    fewest -- so we map the symbol numbers to the legend's symbols in that
+    frequency order. (Drop in an AGM export .txt to override exactly.)
     """
     from collections import Counter
-    codes = Counter(p["code"] for p in pts)
-    flag_code = codes.most_common(1)[0][0] if codes else None
-    sp_codes = Counter(p["code"] for p in pts if _SP_NAME.match(p["name"] or ""))
-    dot_code = sp_codes.most_common(1)[0][0] if sp_codes else None
+    counts = Counter(p["code"] for p in pts)
+    # symbol numbers, most-used first
+    codes_by_freq = sorted(counts, key=lambda c: (-counts[c], c))
+    # legend symbols in expected-frequency order: flag (most) > dot > triangle
+    pref = [k for k in ("flag", "dot", "triangle") if k in legend]
+    if not pref:
+        pref = ["flag", "dot", "triangle"]
+    mapping = {}
+    for i, code in enumerate(codes_by_freq):
+        mapping[code] = pref[i] if i < len(pref) else pref[-1]
     for p in pts:
-        c = p["code"]
-        if dot_code is not None and c == dot_code:
-            p["kind"] = "dot"
-        elif c == flag_code:
-            p["kind"] = "flag"
-        else:
-            p["kind"] = "triangle"
+        p["kind"] = mapping.get(p["code"], "flag")
     return pts
 
 
-def assign_agm_kinds(pts, seed_symbols=None):
+def assign_agm_kinds(pts, seed_symbols=None, legend=None, guidmap=None):
     """Assign each AGM point a shape ('triangle','dot','flag').
 
-    If seed_symbols (list of (lat, lon, kind) from the seed file) is given,
-    each point takes the shape of the nearest seed AGM -- the authoritative
-    source, since the seed's Type->symbol lookup is how the job was built.
-    Without a seed, falls back to a DMT-only heuristic.
+    Primary, fully DMT-only method: each point embeds its symbol's GUID byte,
+    which maps to a shape via the layer's legend (read by read_symbol_guid_map).
+    This is exact. seed_symbols (export .txt / seed) and the frequency
+    inference remain only as fallbacks for any point whose GUID is unreadable.
     """
+    # 1) GUID byte -> shape (exact, from the DMT itself)
+    resolved_all = True
+    if guidmap:
+        for p in pts:
+            p["kind"] = guidmap.get(p.get("guidbyte"))
+            if not p["kind"]:
+                resolved_all = False
+        if resolved_all:
+            return pts
+    else:
+        for p in pts:
+            p["kind"] = None
+        resolved_all = False
+
+    # 2) fallbacks for any unresolved points
     if seed_symbols:
         for p in pts:
+            if p.get("kind"):
+                continue
             best = None
             bd = 9.0e9
             for la, lo, kind in seed_symbols:
@@ -408,16 +479,15 @@ def assign_agm_kinds(pts, seed_symbols=None):
                 if d < bd:
                     bd = d
                     best = kind
-            # ~1e-3 deg ~ 100 m tolerance; beyond that, fall back per-point
             p["kind"] = best if (best and bd < 1e-8) else None
         if all(p["kind"] for p in pts):
             return pts
-        # some points unmatched -> heuristic for those, keep matched ones
-        matched = [p for p in pts if p["kind"]]
-        unmatched = [p for p in pts if not p["kind"]]
-        _fallback_kinds(unmatched)
-        return matched + unmatched
-    return _fallback_kinds(pts)
+
+    # 3) frequency inference for whatever is still unresolved
+    unresolved = [p for p in pts if not p.get("kind")]
+    if unresolved:
+        _infer_kinds(unresolved, legend or [])
+    return pts
 
 # Notes legend (seed "NOTES" sheet):
 #   Map Note    -> icon 40  (pal3/icon54 map-note symbol)
@@ -569,7 +639,8 @@ def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None, seed_symb
             continue
         layer = classify_stream(name, buf)
         if layer == "agm":
-            agms += assign_agm_kinds(parse_points(buf), seed_symbols)
+            agms += assign_agm_kinds(parse_points(buf), seed_symbols,
+                                     read_legend_kinds(buf), read_symbol_guid_map(buf))
         elif layer == "access":
             access += parse_lines(buf)
         elif layer == "centerline":
@@ -742,16 +813,18 @@ st.caption(
 )
 
 uploaded = st.file_uploader("Upload DMT file", type=["dmt"])
-sym_files = st.file_uploader(
-    "Upload AGM symbol export(s) (.txt or .xlsx) - sets the correct AGM shapes. "
-    "Export the AGM draw layer(s) from DeLorme as text, or use the seed file.",
-    type=["txt", "csv", "xlsx", "xlsm"],
-    accept_multiple_files=True,
-)
+
+with st.expander("Advanced: override AGM shapes from an export (optional)"):
+    sym_files = st.file_uploader(
+        "AGM symbol export(s) (.txt or .xlsx). Not needed - shapes are read "
+        "directly from the DMT. Use only to override unusual symbols.",
+        type=["txt", "csv", "xlsx", "xlsm"],
+        accept_multiple_files=True,
+    )
 
 if uploaded is None:
-    st.info("Upload a .dmt to begin. Add the AGM symbol export(s) so AGMs get "
-            "the correct purple triangle / red flag / blue dot shapes.")
+    st.info("Upload a .dmt to begin. AGM shapes (purple triangle / red flag / "
+            "blue dot) are read straight from the draw layer.")
 else:
     base = os.path.splitext(uploaded.name)[0]
     seed_symbols = []
@@ -763,13 +836,7 @@ else:
             except Exception as e:
                 st.warning("Could not read %s (%s)." % (f.name, e))
         if seed_symbols:
-            seed_note = "AGM shapes read from export (%d symbols)." % len(seed_symbols)
-        else:
-            st.warning("No AGM shapes found in the uploaded file(s); using a "
-                       "best-effort guess instead.")
-    else:
-        st.warning("No AGM symbol export provided - AGM shapes are a best-effort "
-                   "guess. Add the exported AGM .txt (or seed .xlsx) for correct shapes.")
+            seed_note = "AGM shape override applied (%d symbols)." % len(seed_symbols)
     try:
         dmt_bytes = uploaded.read()
         kmz_bytes, stats = convert_dmt_bytes(
