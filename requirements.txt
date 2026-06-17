@@ -1,3 +1,2 @@
 streamlit>=1.30
-streamlit>=1.30
 openpyxl>=3.1
