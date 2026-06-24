@@ -145,7 +145,7 @@ _POINT_MARKER = re.compile(rb"\x00\x01\x41")     # <code> 00 01 41
 # the layer's own legend). This is how the shape is recovered DMT-only.
 _SYM_GUID_TAIL = bytes.fromhex("4abc2034d86c41913d754ed0b4c157")
 _GLOBAL_GUID_KIND = {0x6e: "dot", 0x8a: "triangle", 0x5a: "flag"}
-_NOTE_MARKER = re.compile(rb"\x0d\x00\x00\x41")  # text map-note object
+_NOTE_MARKER = re.compile(rb"[\x0d\x0e]\x00\x00\x41")  # text map-note object (0d or 0e)
 
 
 def _cstr(buf, p):
@@ -227,7 +227,10 @@ def parse_text_notes(buf):
             continue
         if not _valid(lon, lat):
             continue
-        out.append({"name": _cstr(buf, ms + 22), "lon": lon, "lat": lat})
+        txt = _cstr(buf, ms + 22)
+        if not txt or not any(32 <= ord(c) < 127 for c in txt):
+            continue  # no readable text -> not a note object
+        out.append({"name": txt, "lon": lon, "lat": lat})
     return out
 
 
@@ -266,28 +269,46 @@ def parse_lines(buf):
 # --------------------------------------------------------------------------
 # Stream -> layer classification
 # --------------------------------------------------------------------------
+def count_agm_points(buf):
+    """Count symbol points whose GUID is a known AGM shape (dot/tri/flag)."""
+    pts = parse_points(buf)
+    return sum(1 for p in pts if p.get("guidbyte") in _GLOBAL_GUID_KIND)
+
+
 def classify_stream(name, buf):
+    """Identify a draw layer as agm / notes / access / centerline / line / None.
+
+    Recognition is by folder name first (most reliable), then by content:
+      * AGMs  - layer name has 'agm', or it contains AGM symbol points
+                (blue dot / purple triangle / red flag, by symbol GUID).
+      * Notes - name has 'note', or it has text-note objects or red X's.
+      * Access - name says 'access' or 'drive'.
+      * Centerline - name says 'centerline'/'center line'/'center'/CL.
+      * 'line' - an unnamed line layer; access vs centerline decided later by
+                 length (access is the longer, winding line).
+    """
     n = name.lower()
-    if "note" in n:
-        return "notes"
     if "agm" in n:
         return "agm"
-    if "access" in n:
+    if "note" in n:
+        return "notes"
+    if "access" in n or "drive" in n:
         return "access"
-    if "centerline" in n or "center" in n or re.search(r"\bcl\b|cl\d", n):
+    if ("centerline" in n or "center line" in n or "center" in n
+            or re.search(r"\bcl\b|cl\d", n)):
         return "centerline"
 
-    n_pts = len(_POINT_MARKER.findall(buf))
-    n_notes = len(_NOTE_MARKER.findall(buf))
+    # ---- content-based fallback (unnamed / oddly-named layers) ----
     n_vtx = buf.count(_VTX_SEP)
-    if n_vtx > max(50, n_pts * 5):
-        ce = buf.count(b"\x0e\x00\x00\x41")
-        ac = max(buf.count(b"\x0f\x00\x00\x41"), buf.count(b"\x11\x00\x00\x41"))
-        return "centerline" if ce >= ac else "access"
-    if n_notes > 0:
-        return "notes"
-    if n_pts > 0:
+    n_agm = count_agm_points(buf)
+    n_notes = len(parse_text_notes(buf))
+    n_redx = len(parse_points(buf)) - n_agm  # symbol points that aren't AGM shapes
+    if n_vtx > max(50, (n_agm + n_notes) * 5):
+        return "line"           # a polyline layer; type resolved by length
+    if n_agm > 0:
         return "agm"
+    if n_notes > 0 or n_redx > 0:
+        return "notes"
     return None
 
 
@@ -630,6 +651,7 @@ def build_kml(doc_name, agms, access, centerline, notes, redx, include_logo=True
 def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None, seed_symbols=None):
     ole = OLEFile(dmt_bytes)
     agms, access, centerline, notes, redx = [], [], [], [], []
+    ambiguous_lines = []   # (vertex_count, [lines]) for layers with no name hint
 
     for name, size in ole.stream_names():
         if size < 16:
@@ -645,10 +667,25 @@ def convert_dmt_bytes(dmt_bytes, doc_name="DMT_Export", logo_png=None, seed_symb
             access += parse_lines(buf)
         elif layer == "centerline":
             centerline += parse_lines(buf)
+        elif layer == "line":
+            lines = parse_lines(buf)
+            ambiguous_lines.append((sum(len(l) for l in lines), lines))
         elif layer == "notes":
             notes += parse_text_notes(buf)
             # symbol points in the Notes layer are red X "Do Not Enter" markers
-            redx += parse_points(buf)
+            for p in parse_points(buf):
+                if p.get("guidbyte") not in _GLOBAL_GUID_KIND:
+                    redx.append(p)
+
+    # Resolve unnamed line layers: the longest winding line is the Access drive,
+    # any others are Centerline (per the rule "access is the longer line").
+    if ambiguous_lines:
+        ambiguous_lines.sort(key=lambda x: -x[0])
+        for i, (_, lines) in enumerate(ambiguous_lines):
+            if i == 0 and not access:
+                access += lines
+            else:
+                centerline += lines
 
     kml = build_kml(doc_name, agms, access, centerline, notes, redx,
                     include_logo=logo_png is not None)
